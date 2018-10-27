@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.ClusterMetricsBuilder;
@@ -43,7 +44,6 @@ import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.UnknownRegionException;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptor;
-import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.MasterSwitchType;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
@@ -350,7 +350,7 @@ public class MasterRpcServices extends RSRpcServices
       throws IOException {
     // RpcServer at HM by default enable ByteBufferPool iff HM having user table region in it
     boolean reservoirEnabled = conf.getBoolean(RESERVOIR_ENABLED_KEY,
-        (LoadBalancer.isTablesOnMaster(conf) && !LoadBalancer.isSystemTablesOnlyOnMaster(conf)));
+        LoadBalancer.isMasterCanHostUserRegions(conf));
     try {
       return RpcServerFactory.createRpcServer(server, name, getServices(),
           bindAddress, // use final bindAddress for this server.
@@ -418,6 +418,7 @@ public class MasterRpcServices extends RSRpcServices
       if (master.cpHost != null) {
         master.cpHost.postBalanceSwitch(oldValue, newValue);
       }
+      master.getLoadBalancer().updateBalancerStatus(newValue);
     } catch (IOException ioe) {
       LOG.warn("Error flipping balance switch", ioe);
     }
@@ -593,7 +594,7 @@ public class MasterRpcServices extends RSRpcServices
       BalanceRequest request) throws ServiceException {
     try {
       return BalanceResponse.newBuilder().setBalancerRan(master.balance(
-        request.hasForce() ? request.getForce() : false)).build();
+        request.hasForce()? request.getForce(): false)).build();
     } catch (IOException ex) {
       throw new ServiceException(ex);
     }
@@ -920,7 +921,10 @@ public class MasterRpcServices extends RSRpcServices
       GetClusterStatusRequest req) throws ServiceException {
     GetClusterStatusResponse.Builder response = GetClusterStatusResponse.newBuilder();
     try {
-      master.checkInitialized();
+      // We used to check if Master was up at this point but let this call proceed even if
+      // Master is initializing... else we shut out stuff like hbck2 tool from making progress
+      // since it queries this method to figure cluster version. hbck2 wants to be able to work
+      // against Master even if it is 'initializing' so it can do fixup.
       response.setClusterStatus(ClusterMetricsBuilder.toClusterStatus(
         master.getClusterMetrics(ClusterMetricsBuilder.toOptions(req.getOptionsList()))));
     } catch (IOException e) {
@@ -1179,7 +1183,8 @@ public class MasterRpcServices extends RSRpcServices
         if (executor.isFinished(procId)) {
           builder.setState(GetProcedureResultResponse.State.FINISHED);
           if (result.isFailed()) {
-            IOException exception = result.getException().unwrapRemoteIOException();
+            IOException exception =
+                MasterProcedureUtil.unwrapRemoteIOException(result);
             builder.setException(ForeignExceptionUtil.toProtoForeignException(exception));
           }
           byte[] resultData = result.getResult();
@@ -1519,11 +1524,7 @@ public class MasterRpcServices extends RSRpcServices
       final RpcController controller,
       final IsInMaintenanceModeRequest request) throws ServiceException {
     IsInMaintenanceModeResponse.Builder response = IsInMaintenanceModeResponse.newBuilder();
-    try {
-      response.setInMaintenanceMode(master.isInMaintenanceMode());
-    } catch (IOException e) {
-      throw new ServiceException(e);
-    }
+    response.setInMaintenanceMode(master.isInMaintenanceMode());
     return response.build();
   }
 
@@ -2294,15 +2295,132 @@ public class MasterRpcServices extends RSRpcServices
   @Override
   public GetTableStateResponse setTableStateInMeta(RpcController controller,
       SetTableStateInMetaRequest request) throws ServiceException {
-    Connection conn = master.getConnection();
     TableName tn = ProtobufUtil.toTableName(request.getTableName());
-
     try {
-      HBaseProtos.TableState prevState = MetaTableAccessor.getTableState(conn, tn).convert();
-      MetaTableAccessor.updateTableState(conn, tn,
+      HBaseProtos.TableState prevState =
+          this.master.getTableStateManager().getTableState(tn).convert();
+      this.master.getTableStateManager().setTableState(tn,
           TableState.convert(tn, request.getTableState()).getState());
       return GetTableStateResponse.newBuilder().setTableState(prevState).build();
     } catch (Exception e) {
+      throw new ServiceException(e);
+    }
+  }
+
+  /**
+   * Get RegionInfo from Master using content of RegionSpecifier as key.
+   * @return RegionInfo found by decoding <code>rs</code> or null if none found
+   */
+  private RegionInfo getRegionInfo(HBaseProtos.RegionSpecifier rs) throws UnknownRegionException {
+    RegionInfo ri = null;
+    switch(rs.getType()) {
+      case REGION_NAME:
+        final byte[] regionName = rs.getValue().toByteArray();
+        ri = this.master.getAssignmentManager().getRegionInfo(regionName);
+        break;
+      case ENCODED_REGION_NAME:
+        String encodedRegionName = Bytes.toString(rs.getValue().toByteArray());
+        RegionState regionState = this.master.getAssignmentManager().getRegionStates().
+            getRegionState(encodedRegionName);
+        ri = regionState == null? null: regionState.getRegion();
+        break;
+      default:
+        break;
+    }
+    return ri;
+  }
+
+  /**
+   * Submit the Procedure that gets created by <code>f</code>
+   * @return pid of the submitted Procedure.
+   */
+  private long submitProcedure(HBaseProtos.RegionSpecifier rs, boolean override,
+      BiFunction<RegionInfo, Boolean, Procedure> f)
+    throws UnknownRegionException {
+    RegionInfo ri = getRegionInfo(rs);
+    long pid = Procedure.NO_PROC_ID;
+    if (ri == null) {
+      LOG.warn("No RegionInfo found to match {}", rs);
+    } else {
+      pid = this.master.getMasterProcedureExecutor().submitProcedure(f.apply(ri, override));
+    }
+    return pid;
+  }
+
+  /**
+   * A 'raw' version of assign that does bulk and skirts Master state checks (assigns can be made
+   * during Master startup). For use by Hbck2.
+   */
+  @Override
+  public MasterProtos.AssignsResponse assigns(RpcController controller,
+      MasterProtos.AssignsRequest request)
+    throws ServiceException {
+    LOG.info(master.getClientIdAuditPrefix() + " assigns");
+    if (this.master.getMasterProcedureExecutor() == null) {
+      throw new ServiceException("Master's ProcedureExecutor not initialized; retry later");
+    }
+    MasterProtos.AssignsResponse.Builder responseBuilder =
+        MasterProtos.AssignsResponse.newBuilder();
+    try {
+      boolean override = request.getOverride();
+      for (HBaseProtos.RegionSpecifier rs: request.getRegionList()) {
+        long pid = submitProcedure(rs, override,
+          (r, b) -> this.master.getAssignmentManager().createAssignProcedure(r, b));
+        responseBuilder.addPid(pid);
+      }
+      return responseBuilder.build();
+    } catch (IOException ioe) {
+      throw new ServiceException(ioe);
+    }
+  }
+
+  /**
+   * A 'raw' version of unassign that does bulk and skirts Master state checks (unassigns can be
+   * made during Master startup). For use by Hbck2.
+   */
+  @Override
+  public MasterProtos.UnassignsResponse unassigns(RpcController controller,
+      MasterProtos.UnassignsRequest request)
+      throws ServiceException {
+    LOG.info(master.getClientIdAuditPrefix() + " unassigns");
+    if (this.master.getMasterProcedureExecutor() == null) {
+      throw new ServiceException("Master's ProcedureExecutor not initialized; retry later");
+    }
+    MasterProtos.UnassignsResponse.Builder responseBuilder =
+        MasterProtos.UnassignsResponse.newBuilder();
+    try {
+      boolean override = request.getOverride();
+      for (HBaseProtos.RegionSpecifier rs: request.getRegionList()) {
+        long pid = submitProcedure(rs, override,
+          (r, b) -> this.master.getAssignmentManager().createUnassignProcedure(r, b));
+        responseBuilder.addPid(pid);
+      }
+      return responseBuilder.build();
+    } catch (IOException ioe) {
+      throw new ServiceException(ioe);
+    }
+  }
+
+  /**
+   * Bypass specified procedure to completion. Procedure is marked completed but no actual work
+   * is done from the current state/ step onwards. Parents of the procedure are also marked for
+   * bypass.
+   *
+   * NOTE: this is a dangerous operation and may be used to unstuck buggy procedures. This may
+   * leave system in inconherent state. This may need to be followed by some cleanup steps/
+   * actions by operator.
+   *
+   * @return BypassProcedureToCompletionResponse indicating success or failure
+   */
+  @Override
+  public MasterProtos.BypassProcedureResponse bypassProcedure(RpcController controller,
+      MasterProtos.BypassProcedureRequest request) throws ServiceException {
+    try {
+      List<Boolean> ret =
+          master.getMasterProcedureExecutor().bypassProcedure(request.getProcIdList(),
+          request.getWaitTime(), request.getOverride(), request.getRecursive());
+      return MasterProtos.BypassProcedureResponse.newBuilder().addAllBypassed(ret).build();
+    } catch (IOException e) {
       throw new ServiceException(e);
     }
   }

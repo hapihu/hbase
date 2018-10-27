@@ -15,13 +15,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.hadoop.hbase.procedure2;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -31,6 +31,8 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -44,6 +46,7 @@ import org.apache.hadoop.hbase.log.HBaseMarkers;
 import org.apache.hadoop.hbase.procedure2.Procedure.LockState;
 import org.apache.hadoop.hbase.procedure2.store.ProcedureStore;
 import org.apache.hadoop.hbase.procedure2.store.ProcedureStore.ProcedureIterator;
+import org.apache.hadoop.hbase.procedure2.store.ProcedureStore.ProcedureStoreListener;
 import org.apache.hadoop.hbase.procedure2.util.StringUtils;
 import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
@@ -56,6 +59,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;
 import org.apache.hbase.thirdparty.com.google.common.base.Preconditions;
+import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 import org.apache.hadoop.hbase.shaded.protobuf.generated.ProcedureProtos.ProcedureState;
 
@@ -82,6 +86,12 @@ public class ProcedureExecutor<TEnvironment> {
   public static final String WORKER_KEEP_ALIVE_TIME_CONF_KEY =
       "hbase.procedure.worker.keep.alive.time.msec";
   private static final long DEFAULT_WORKER_KEEP_ALIVE_TIME = TimeUnit.MINUTES.toMillis(1);
+
+  // Enable this flag if you want to upgrade to 2.2+, there are some incompatible changes on how we
+  // assign or unassign a region, so we need to make sure all these procedures have been finished
+  // before we start the master with new code. See HBASE-20881 and HBASE-21075 for more details.
+  public static final String UPGRADE_TO_2_2 = "hbase.procedure.upgrade-to-2-2";
+  private static final boolean DEFAULT_UPGRADE_TO_2_2 = false;
 
   /**
    * {@link #testing} is non-null when ProcedureExecutor is being tested. Tests will try to
@@ -307,7 +317,7 @@ public class ProcedureExecutor<TEnvironment> {
   private Configuration conf;
 
   /**
-   * Created in the {@link #start(int, boolean)} method. Destroyed in {@link #join()} (FIX! Doing
+   * Created in the {@link #init(int, boolean)} method. Destroyed in {@link #join()} (FIX! Doing
    * resource handling rather than observing in a #join is unexpected).
    * Overridden when we do the ProcedureTestingUtility.testRecoveryAndDoubleExecution trickery
    * (Should be ok).
@@ -315,7 +325,7 @@ public class ProcedureExecutor<TEnvironment> {
   private ThreadGroup threadGroup;
 
   /**
-   * Created in the {@link #start(int, boolean)} method. Terminated in {@link #join()} (FIX! Doing
+   * Created in the {@link #init(int, boolean)}  method. Terminated in {@link #join()} (FIX! Doing
    * resource handling rather than observing in a #join is unexpected).
    * Overridden when we do the ProcedureTestingUtility.testRecoveryAndDoubleExecution trickery
    * (Should be ok).
@@ -323,7 +333,7 @@ public class ProcedureExecutor<TEnvironment> {
   private CopyOnWriteArrayList<WorkerThread> workerThreads;
 
   /**
-   * Created in the {@link #start(int, boolean)} method. Terminated in {@link #join()} (FIX! Doing
+   * Created in the {@link #init(int, boolean)} method. Terminated in {@link #join()} (FIX! Doing
    * resource handling rather than observing in a #join is unexpected).
    * Overridden when we do the ProcedureTestingUtility.testRecoveryAndDoubleExecution trickery
    * (Should be ok).
@@ -339,6 +349,9 @@ public class ProcedureExecutor<TEnvironment> {
    * Scheduler/Queue that contains runnable procedures.
    */
   private final ProcedureScheduler scheduler;
+
+  private final Executor forceUpdateExecutor = Executors.newSingleThreadExecutor(
+    new ThreadFactoryBuilder().setDaemon(true).setNameFormat("Force-Update-PEWorker-%d").build());
 
   private final AtomicLong lastProcId = new AtomicLong(-1);
   private final AtomicLong workerId = new AtomicLong(0);
@@ -357,9 +370,37 @@ public class ProcedureExecutor<TEnvironment> {
   // execution of the same procedure.
   private final IdLock procExecutionLock = new IdLock();
 
+  private final boolean upgradeTo2_2;
+
   public ProcedureExecutor(final Configuration conf, final TEnvironment environment,
       final ProcedureStore store) {
     this(conf, environment, store, new SimpleProcedureScheduler());
+  }
+
+  private boolean isRootFinished(Procedure<?> proc) {
+    Procedure<?> rootProc = procedures.get(proc.getRootProcId());
+    return rootProc == null || rootProc.isFinished();
+  }
+
+  private void forceUpdateProcedure(long procId) throws IOException {
+    IdLock.Entry lockEntry = procExecutionLock.getLockEntry(procId);
+    try {
+      Procedure<TEnvironment> proc = procedures.get(procId);
+      if (proc == null) {
+        LOG.debug("No pending procedure with id = {}, skip force updating.", procId);
+        return;
+      }
+      // For a sub procedure which root parent has not been finished, we still need to retain the
+      // wal even if the procedure itself is finished.
+      if (proc.isFinished() && (!proc.hasParent() || isRootFinished(proc))) {
+        LOG.debug("Procedure {} has already been finished, skip force updating.", proc);
+        return;
+      }
+      LOG.debug("Force update procedure {}", proc);
+      store.update(proc);
+    } finally {
+      procExecutionLock.releaseLockEntry(lockEntry);
+    }
   }
 
   public ProcedureExecutor(final Configuration conf, final TEnvironment environment,
@@ -369,8 +410,21 @@ public class ProcedureExecutor<TEnvironment> {
     this.store = store;
     this.conf = conf;
     this.checkOwnerSet = conf.getBoolean(CHECK_OWNER_SET_CONF_KEY, DEFAULT_CHECK_OWNER_SET);
+    this.upgradeTo2_2 = conf.getBoolean(UPGRADE_TO_2_2, DEFAULT_UPGRADE_TO_2_2);
     refreshConfiguration(conf);
+    store.registerListener(new ProcedureStoreListener() {
 
+      @Override
+      public void forceUpdate(long[] procIds) {
+        Arrays.stream(procIds).forEach(procId -> forceUpdateExecutor.execute(() -> {
+          try {
+            forceUpdateProcedure(procId);
+          } catch (IOException e) {
+            LOG.warn("Failed to force update procedure with pid={}", procId);
+          }
+        }));
+      }
+    });
   }
 
   private void load(final boolean abortOnCorruption) throws IOException {
@@ -453,8 +507,10 @@ public class ProcedureExecutor<TEnvironment> {
   private void loadProcedures(ProcedureIterator procIter, boolean abortOnCorruption)
       throws IOException {
     // 1. Build the rollback stack
-    int runnablesCount = 0;
+    int runnableCount = 0;
     int failedCount = 0;
+    int waitingCount = 0;
+    int waitingTimeoutCount = 0;
     while (procIter.hasNext()) {
       boolean finished = procIter.isNextFinished();
       Procedure<TEnvironment> proc = procIter.next();
@@ -473,11 +529,21 @@ public class ProcedureExecutor<TEnvironment> {
         // add the procedure to the map
         proc.beforeReplay(getEnvironment());
         procedures.put(proc.getProcId(), proc);
-
-        if (proc.getState() == ProcedureState.RUNNABLE) {
-          runnablesCount++;
-        } else if (proc.getState() == ProcedureState.FAILED) {
-          failedCount++;
+        switch (proc.getState()) {
+          case RUNNABLE:
+            runnableCount++;
+            break;
+          case FAILED:
+            failedCount++;
+            break;
+          case WAITING:
+            waitingCount++;
+            break;
+          case WAITING_TIMEOUT:
+            waitingTimeoutCount++;
+            break;
+          default:
+            break;
         }
       }
 
@@ -498,9 +564,10 @@ public class ProcedureExecutor<TEnvironment> {
     // have been polled out already, so when loading we can not add the procedure to scheduler first
     // and then call acquireLock, since the procedure is still in the queue, and since we will
     // remove the queue from runQueue, then no one can poll it out, then there is a dead lock
-    List<Procedure<TEnvironment>> runnableList = new ArrayList<>(runnablesCount);
+    List<Procedure<TEnvironment>> runnableList = new ArrayList<>(runnableCount);
     List<Procedure<TEnvironment>> failedList = new ArrayList<>(failedCount);
-    Set<Procedure<TEnvironment>> waitingSet = null;
+    List<Procedure<TEnvironment>> waitingList = new ArrayList<>(waitingCount);
+    List<Procedure<TEnvironment>> waitingTimeoutList = new ArrayList<>(waitingTimeoutCount);
     procIter.reset();
     while (procIter.hasNext()) {
       if (procIter.isNextFinished()) {
@@ -514,15 +581,11 @@ public class ProcedureExecutor<TEnvironment> {
       LOG.debug("Loading {}", proc);
 
       Long rootProcId = getRootProcedureId(proc);
-      if (rootProcId == null) {
-        // The 'proc' was ready to run but the root procedure was rolledback?
-        scheduler.addBack(proc);
-        continue;
-      }
+      // The orphan procedures will be passed to handleCorrupted, so add an assert here
+      assert rootProcId != null;
 
       if (proc.hasParent()) {
         Procedure<TEnvironment> parent = procedures.get(proc.getParentProcId());
-        // corrupted procedures are handled later at step 3
         if (parent != null && !proc.isFinished()) {
           parent.incChildrenLatch();
         }
@@ -537,26 +600,10 @@ public class ProcedureExecutor<TEnvironment> {
           runnableList.add(proc);
           break;
         case WAITING:
-          if (!proc.hasChildren()) {
-            // Normally, WAITING procedures should be waken by its children.
-            // But, there is a case that, all the children are successful and before
-            // they can wake up their parent procedure, the master was killed.
-            // So, during recovering the procedures from ProcedureWal, its children
-            // are not loaded because of their SUCCESS state.
-            // So we need to continue to run this WAITING procedure. But before
-            // executing, we need to set its state to RUNNABLE, otherwise, a exception
-            // will throw:
-            // Preconditions.checkArgument(procedure.getState() == ProcedureState.RUNNABLE,
-            // "NOT RUNNABLE! " + procedure.toString());
-            proc.setState(ProcedureState.RUNNABLE);
-            runnableList.add(proc);
-          }
+          waitingList.add(proc);
           break;
         case WAITING_TIMEOUT:
-          if (waitingSet == null) {
-            waitingSet = new HashSet<>();
-          }
-          waitingSet.add(proc);
+          waitingTimeoutList.add(proc);
           break;
         case FAILED:
           failedList.add(proc);
@@ -571,36 +618,31 @@ public class ProcedureExecutor<TEnvironment> {
       }
     }
 
-    // 3. Validate the stacks
-    int corruptedCount = 0;
-    Iterator<Map.Entry<Long, RootProcedureState<TEnvironment>>> itStack =
-      rollbackStack.entrySet().iterator();
-    while (itStack.hasNext()) {
-      Map.Entry<Long, RootProcedureState<TEnvironment>> entry = itStack.next();
-      RootProcedureState<TEnvironment> procStack = entry.getValue();
-      if (procStack.isValid()) continue;
-
-      for (Procedure<TEnvironment> proc : procStack.getSubproceduresStack()) {
-        LOG.error("Corrupted " + proc);
-        procedures.remove(proc.getProcId());
-        runnableList.remove(proc);
-        if (waitingSet != null) waitingSet.remove(proc);
-        corruptedCount++;
+    // 3. Check the waiting procedures to see if some of them can be added to runnable.
+    waitingList.forEach(proc -> {
+      if (!proc.hasChildren()) {
+        // Normally, WAITING procedures should be waken by its children.
+        // But, there is a case that, all the children are successful and before
+        // they can wake up their parent procedure, the master was killed.
+        // So, during recovering the procedures from ProcedureWal, its children
+        // are not loaded because of their SUCCESS state.
+        // So we need to continue to run this WAITING procedure. But before
+        // executing, we need to set its state to RUNNABLE, otherwise, a exception
+        // will throw:
+        // Preconditions.checkArgument(procedure.getState() == ProcedureState.RUNNABLE,
+        // "NOT RUNNABLE! " + procedure.toString());
+        proc.setState(ProcedureState.RUNNABLE);
+        runnableList.add(proc);
+      } else {
+        proc.afterReplay(getEnvironment());
       }
-      itStack.remove();
-    }
-
-    if (abortOnCorruption && corruptedCount > 0) {
-      throw new IOException("found " + corruptedCount + " procedures on replay");
-    }
+    });
 
     // 4. Push the procedures to the timeout executor
-    if (waitingSet != null && !waitingSet.isEmpty()) {
-      for (Procedure<TEnvironment> proc: waitingSet) {
-        proc.afterReplay(getEnvironment());
-        timeoutExecutor.add(proc);
-      }
-    }
+    waitingTimeoutList.forEach(proc -> {
+      proc.afterReplay(getEnvironment());
+      timeoutExecutor.add(proc);
+    });
     // 5. restore locks
     restoreLocks();
     // 6. Push the procedure to the scheduler
@@ -610,8 +652,30 @@ public class ProcedureExecutor<TEnvironment> {
       if (!p.hasParent()) {
         sendProcedureLoadedNotification(p.getProcId());
       }
-      scheduler.addBack(p);
+      // If the procedure holds the lock, put the procedure in front
+      // If its parent holds the lock, put the procedure in front
+      // TODO. Is that possible that its ancestor holds the lock?
+      // For now, the deepest procedure hierarchy is:
+      // ModifyTableProcedure -> ReopenTableProcedure ->
+      // MoveTableProcedure -> Unassign/AssignProcedure
+      // But ModifyTableProcedure and ReopenTableProcedure won't hold the lock
+      // So, check parent lock is enough(a tricky case is resovled by HBASE-21384).
+      // If some one change or add new procedures making 'grandpa' procedure
+      // holds the lock, but parent procedure don't hold the lock, there will
+      // be a problem here. We have to check one procedure's ancestors.
+      // And we need to change LockAndQueue.hasParentLock(Procedure<?> proc) method
+      // to check all ancestors too.
+      if (p.isLockedWhenLoading() || (p.hasParent() && procedures
+          .get(p.getParentProcId()).isLockedWhenLoading())) {
+        scheduler.addFront(p, false);
+      } else {
+        // if it was not, it can wait.
+        scheduler.addBack(p, false);
+      }
     });
+    // After all procedures put into the queue, signal the worker threads.
+    // Otherwise, there is a race condition. See HBASE-21364.
+    scheduler.signalAll();
   }
 
   /**
@@ -683,6 +747,25 @@ public class ProcedureExecutor<TEnvironment> {
 
     // Internal chores
     timeoutExecutor.add(new WorkerMonitor());
+
+    if (upgradeTo2_2) {
+      timeoutExecutor.add(new InlineChore() {
+
+        @Override
+        public void run() {
+          if (procedures.isEmpty()) {
+            LOG.info("UPGRADE OK: All existed procedures have been finished, quit...");
+            System.exit(0);
+          }
+        }
+
+        @Override
+        public int getTimeoutInterval() {
+          // check every 5 seconds to see if we can quit
+          return 5000;
+        }
+      });
+    }
 
     // Add completed cleaner chore
     addChore(new CompletedProcedureCleaner<>(conf, store, completed, nonceKeysToProcIdsMap));
@@ -967,7 +1050,7 @@ public class ProcedureExecutor<TEnvironment> {
    * Bypass a procedure. If the procedure is set to bypass, all the logic in
    * execute/rollback will be ignored and it will return success, whatever.
    * It is used to recover buggy stuck procedures, releasing the lock resources
-   * and letting other procedures to run. Bypassing one procedure (and its ancestors will
+   * and letting other procedures run. Bypassing one procedure (and its ancestors will
    * be bypassed automatically) may leave the cluster in a middle state, e.g. region
    * not assigned, or some hdfs files left behind. After getting rid of those stuck procedures,
    * the operators may have to do some clean up on hdfs or schedule some assign procedures
@@ -986,7 +1069,7 @@ public class ProcedureExecutor<TEnvironment> {
    * <p>
    * If the procedure is in WAITING state, will set it to RUNNABLE add it to run queue.
    * TODO: What about WAITING_TIMEOUT?
-   * @param id the procedure id
+   * @param pids the procedure id
    * @param lockWait time to wait lock
    * @param force if force set to true, we will bypass the procedure even if it is executing.
    *              This is for procedures which can't break out during executing(due to bug, mostly)
@@ -994,56 +1077,91 @@ public class ProcedureExecutor<TEnvironment> {
    *              there. We need to restart the master after bypassing, and letting the problematic
    *              procedure to execute wth bypass=true, so in that condition, the procedure can be
    *              successfully bypassed.
+   * @param recursive We will do an expensive search for children of each pid. EXPENSIVE!
    * @return true if bypass success
    * @throws IOException IOException
    */
-  public boolean bypassProcedure(long id, long lockWait, boolean force) throws IOException  {
-    Procedure<TEnvironment> procedure = getProcedure(id);
+  public List<Boolean> bypassProcedure(List<Long> pids, long lockWait, boolean force,
+      boolean recursive)
+      throws IOException {
+    List<Boolean> result = new ArrayList<Boolean>(pids.size());
+    for(long pid: pids) {
+      result.add(bypassProcedure(pid, lockWait, force, recursive));
+    }
+    return result;
+  }
+
+  boolean bypassProcedure(long pid, long lockWait, boolean override, boolean recursive)
+      throws IOException {
+    Preconditions.checkArgument(lockWait > 0, "lockWait should be positive");
+    final Procedure<TEnvironment> procedure = getProcedure(pid);
     if (procedure == null) {
-      LOG.debug("Procedure with id={} does not exist, skipping bypass", id);
+      LOG.debug("Procedure pid={} does not exist, skipping bypass", pid);
       return false;
     }
 
-    LOG.debug("Begin bypass {} with lockWait={}, force={}", procedure, lockWait, force);
-
+    LOG.info("Begin bypass {} with lockWait={}, override={}, recursive={}",
+        procedure, lockWait, override, recursive);
     IdLock.Entry lockEntry = procExecutionLock.tryLockEntry(procedure.getProcId(), lockWait);
-    if (lockEntry == null && !force) {
-      LOG.debug("Waited {} ms, but {} is still running, skipping bypass with force={}",
-          lockWait, procedure, force);
+    if (lockEntry == null && !override) {
+      LOG.info("Waited {} ms, but {} is still running, skipping bypass with override={}",
+          lockWait, procedure, override);
       return false;
     } else if (lockEntry == null) {
-      LOG.debug("Waited {} ms, but {} is still running, begin bypass with force={}",
-          lockWait, procedure, force);
+      LOG.info("Waited {} ms, but {} is still running, begin bypass with override={}",
+          lockWait, procedure, override);
     }
     try {
       // check whether the procedure is already finished
       if (procedure.isFinished()) {
-        LOG.debug("{} is already finished, skipping bypass", procedure);
+        LOG.info("{} is already finished, skipping bypass", procedure);
         return false;
       }
 
       if (procedure.hasChildren()) {
-        LOG.debug("{} has children, skipping bypass", procedure);
-        return false;
+        if (recursive) {
+          // EXPENSIVE. Checks each live procedure of which there could be many!!!
+          // Is there another way to get children of a procedure?
+          LOG.info("Recursive bypass on children of pid={}", procedure.getProcId());
+          this.procedures.forEachValue(1 /*Single-threaded*/,
+            // Transformer
+            v -> {
+             return v.getParentProcId() == procedure.getProcId()? v: null;
+            },
+            // Consumer
+            v -> {
+              boolean result = false;
+              IOException ioe = null;
+              try {
+                result = bypassProcedure(v.getProcId(), lockWait, override, recursive);
+              } catch (IOException e) {
+                LOG.warn("Recursive bypass of pid={}", v.getProcId(), e);
+              }
+            });
+        } else {
+          LOG.info("{} has children, skipping bypass", procedure);
+          return false;
+        }
       }
 
       // If the procedure has no parent or no child, we are safe to bypass it in whatever state
       if (procedure.hasParent() && procedure.getState() != ProcedureState.RUNNABLE
           && procedure.getState() != ProcedureState.WAITING
           && procedure.getState() != ProcedureState.WAITING_TIMEOUT) {
-        LOG.debug("Bypassing procedures in RUNNABLE, WAITING and WAITING_TIMEOUT states "
+        LOG.info("Bypassing procedures in RUNNABLE, WAITING and WAITING_TIMEOUT states "
                 + "(with no parent), {}",
             procedure);
+        // Question: how is the bypass done here?
         return false;
       }
 
       // Now, the procedure is not finished, and no one can execute it since we take the lock now
       // And we can be sure that its ancestor is not running too, since their child has not
       // finished yet
-      Procedure current = procedure;
+      Procedure<TEnvironment> current = procedure;
       while (current != null) {
-        LOG.debug("Bypassing {}", current);
-        current.bypass();
+        LOG.info("Bypassing {}", current);
+        current.bypass(getEnvironment());
         store.update(procedure);
         long parentID = current.getParentProcId();
         current = getProcedure(parentID);
@@ -1062,9 +1180,9 @@ public class ProcedureExecutor<TEnvironment> {
       if (lockEntry != null) {
         // add the procedure to run queue,
         scheduler.addFront(procedure);
-        LOG.debug("Bypassing {} and its ancestors successfully, adding to queue", procedure);
+        LOG.info("Bypassing {} and its ancestors successfully, adding to queue", procedure);
       } else {
-        LOG.debug("Bypassing {} and its ancestors successfully, but since it is already running, "
+        LOG.info("Bypassing {} and its ancestors successfully, but since it is already running, "
             + "skipping add to queue", procedure);
       }
       return true;
@@ -1131,10 +1249,9 @@ public class ProcedureExecutor<TEnvironment> {
     if (LOG.isDebugEnabled()) {
       LOG.debug("Stored " + Arrays.toString(procs));
     }
-
     // Add the procedure to the executor
-    for (int i = 0; i < procs.length; ++i) {
-      pushProcedure(procs[i]);
+    for (Procedure<TEnvironment> proc : procs) {
+      pushProcedure(proc);
     }
   }
 
@@ -1148,7 +1265,12 @@ public class ProcedureExecutor<TEnvironment> {
   }
 
   private long pushProcedure(Procedure<TEnvironment> proc) {
-    final long currentProcId = proc.getProcId();
+    long currentProcId = proc.getProcId();
+    // If we are going to upgrade to 2.2+, and this is not a sub procedure, do not push it to
+    // scheduler. After we finish all the ongoing procedures, the master will quit.
+    if (upgradeTo2_2 && !proc.hasParent()) {
+      return currentProcId;
+    }
 
     // Update metrics on start of a procedure
     proc.updateMetricsOnSubmit(getEnvironment());
@@ -1290,6 +1412,18 @@ public class ProcedureExecutor<TEnvironment> {
     // Procedure either does not exist or has already completed and got cleaned up.
     // At this time, we cannot check the owner of the procedure
     return false;
+  }
+
+
+  /**
+   * Should only be used when starting up, where the procedure workers have not been started.
+   * <p/>
+   * If the procedure works has been started, the return values maybe changed when you are
+   * processing it so usually this is not safe. Use {@link #getProcedures()} below for most cases as
+   * it will do a copy, and also include the finished procedures.
+   */
+  public Collection<Procedure<TEnvironment>> getActiveProceduresNoCopy() {
+    return procedures.values();
   }
 
   /**
@@ -1474,9 +1608,17 @@ public class ProcedureExecutor<TEnvironment> {
       procStack.release(proc);
 
       if (proc.isSuccess()) {
-        // update metrics on finishing the procedure
+        // update metrics on finishing the procedure.
         proc.updateMetricsOnFinish(getEnvironment(), proc.elapsedTime(), true);
-        LOG.info("Finished " + proc + " in " + StringUtils.humanTimeDiff(proc.elapsedTime()));
+        // Print out count of outstanding siblings if this procedure has a parent.
+        Procedure<TEnvironment> parent = null;
+        if (proc.hasParent()) {
+          parent = procedures.get(proc.getParentProcId());
+        }
+        LOG.info("Finished {} in {}{}",
+            proc,
+            StringUtils.humanTimeDiff(proc.elapsedTime()),
+            parent != null? (", unfinishedSiblingCount=" + parent.getChildrenLatch()): "");
         // Finalize the procedure state
         if (proc.getProcId() == rootProcId) {
           procedureFinished(proc);
@@ -1528,7 +1670,19 @@ public class ProcedureExecutor<TEnvironment> {
     int stackTail = subprocStack.size();
     while (stackTail-- > 0) {
       Procedure<TEnvironment> proc = subprocStack.get(stackTail);
-
+      // For the sub procedures which are successfully finished, we do not rollback them.
+      // Typically, if we want to rollback a procedure, we first need to rollback it, and then
+      // recursively rollback its ancestors. The state changes which are done by sub procedures
+      // should be handled by parent procedures when rolling back. For example, when rolling back a
+      // MergeTableProcedure, we will schedule new procedures to bring the offline regions online,
+      // instead of rolling back the original procedures which offlined the regions(in fact these
+      // procedures can not be rolled back...).
+      if (proc.isSuccess()) {
+        // Just do the cleanup work, without actually executing the rollback
+        subprocStack.remove(stackTail);
+        cleanupAfterRollbackOneStep(proc);
+        continue;
+      }
       LockState lockState = acquireLock(proc);
       if (lockState != LockState.LOCK_ACQUIRED) {
         // can't take a lock on the procedure, add the root-proc back on the
@@ -1567,6 +1721,31 @@ public class ProcedureExecutor<TEnvironment> {
     return LockState.LOCK_ACQUIRED;
   }
 
+  private void cleanupAfterRollbackOneStep(Procedure<TEnvironment> proc) {
+    if (proc.removeStackIndex()) {
+      if (!proc.isSuccess()) {
+        proc.setState(ProcedureState.ROLLEDBACK);
+      }
+
+      // update metrics on finishing the procedure (fail)
+      proc.updateMetricsOnFinish(getEnvironment(), proc.elapsedTime(), false);
+
+      if (proc.hasParent()) {
+        store.delete(proc.getProcId());
+        procedures.remove(proc.getProcId());
+      } else {
+        final long[] childProcIds = rollbackStack.get(proc.getProcId()).getSubprocedureIds();
+        if (childProcIds != null) {
+          store.delete(proc, childProcIds);
+        } else {
+          store.update(proc);
+        }
+      }
+    } else {
+      store.update(proc);
+    }
+  }
+
   /**
    * Execute the rollback of the procedure step.
    * It updates the store with the new state (stack index)
@@ -1595,26 +1774,7 @@ public class ProcedureExecutor<TEnvironment> {
       throw new RuntimeException(msg);
     }
 
-    if (proc.removeStackIndex()) {
-      proc.setState(ProcedureState.ROLLEDBACK);
-
-      // update metrics on finishing the procedure (fail)
-      proc.updateMetricsOnFinish(getEnvironment(), proc.elapsedTime(), false);
-
-      if (proc.hasParent()) {
-        store.delete(proc.getProcId());
-        procedures.remove(proc.getProcId());
-      } else {
-        final long[] childProcIds = rollbackStack.get(proc.getProcId()).getSubprocedureIds();
-        if (childProcIds != null) {
-          store.delete(proc, childProcIds);
-        } else {
-          store.update(proc);
-        }
-      }
-    } else {
-      store.update(proc);
-    }
+    cleanupAfterRollbackOneStep(proc);
 
     return LockState.LOCK_ACQUIRED;
   }
@@ -1670,6 +1830,7 @@ public class ProcedureExecutor<TEnvironment> {
     Procedure<TEnvironment>[] subprocs = null;
     do {
       reExecute = false;
+      procedure.resetPersistence();
       try {
         subprocs = procedure.doExecute(getEnvironment());
         if (subprocs != null && subprocs.length == 0) {
@@ -1737,7 +1898,9 @@ public class ProcedureExecutor<TEnvironment> {
       //
       // Commit the transaction even if a suspend (state may have changed). Note this append
       // can take a bunch of time to complete.
-      updateStoreOnExec(procStack, procedure, subprocs);
+      if (procedure.needPersistence()) {
+        updateStoreOnExec(procStack, procedure, subprocs);
+      }
 
       // if the store is not running we are aborting
       if (!store.isRunning()) {
@@ -1932,6 +2095,11 @@ public class ProcedureExecutor<TEnvironment> {
     return rollbackStack.get(rootProcId);
   }
 
+  @VisibleForTesting
+  ProcedureScheduler getProcedureScheduler() {
+    return scheduler;
+  }
+
   // ==========================================================================
   //  Worker Thread
   // ==========================================================================
@@ -1952,7 +2120,6 @@ public class ProcedureExecutor<TEnvironment> {
     public void sendStopSignal() {
       scheduler.signalAll();
     }
-
     @Override
     public void run() {
       long lastUpdate = EnvironmentEdgeManager.currentTime();

@@ -34,6 +34,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.ClockOutOfSyncException;
 import org.apache.hadoop.hbase.HConstants;
@@ -48,6 +49,7 @@ import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RetriesExhaustedException;
 import org.apache.hadoop.hbase.ipc.HBaseRpcController;
 import org.apache.hadoop.hbase.ipc.RpcControllerFactory;
+import org.apache.hadoop.hbase.master.procedure.ServerCrashProcedure;
 import org.apache.hadoop.hbase.monitoring.MonitoredTask;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -247,8 +249,7 @@ public class ServerManager {
   }
 
   @VisibleForTesting
-  public void regionServerReport(ServerName sn,
-    ServerMetrics sl) throws YouAreDeadException {
+  public void regionServerReport(ServerName sn, ServerMetrics sl) throws YouAreDeadException {
     checkIsDead(sn, "REPORT");
     if (null == this.onlineServers.replace(sn, sl)) {
       // Already have this host+port combo and its just different start code?
@@ -316,9 +317,9 @@ public class ServerManager {
    * @param deadServersFromPE the region servers which already have a SCP associated.
    * @param liveServersFromWALDir the live region servers from wal directory.
    */
-  void findDeadServersAndProcess(Set<ServerName> deadServersFromPE,
+  void findDeadServersAndProcess(Set<ServerCrashProcedure> deadServersFromPE,
       Set<ServerName> liveServersFromWALDir) {
-    deadServersFromPE.forEach(deadservers::add);
+    deadServersFromPE.forEach(scp -> deadservers.add(scp.getServerName(), !scp.isFinished()));
     liveServersFromWALDir.stream().filter(sn -> !onlineServers.containsKey(sn))
       .forEach(this::expireServer);
   }
@@ -529,6 +530,16 @@ public class ServerManager {
   }
 
   /**
+   * @return True if we should expire <code>serverName</code>
+   */
+  boolean expire(ServerName serverName) {
+    return this.onlineServers.containsKey(serverName) ||
+        this.deadservers.isDeadServer(serverName) ||
+        this.master.getAssignmentManager().getRegionStates().getServerNode(serverName) != null ||
+        this.master.getMasterWalManager().isWALDirectoryNameWithWALs(serverName);
+  }
+
+  /**
    * Expire the passed server. Add it to list of dead servers and queue a shutdown processing.
    * @return True if we queued a ServerCrashProcedure else false if we did not (could happen for
    *         many reasons including the fact that its this server that is going down or we already
@@ -543,11 +554,24 @@ public class ServerManager {
       }
       return false;
     }
-    if (this.deadservers.isDeadServer(serverName)) {
-      LOG.warn("Expiration called on {} but crash processing already in progress", serverName);
+    // Check if we should bother running an expire!
+    if (!expire(serverName)) {
+      LOG.info("Skipping expire; {} is not online, not in deadservers, not in fs -- presuming " +
+          "long gone server instance!", serverName);
       return false;
     }
-    moveFromOnlineToDeadServers(serverName);
+
+    if (this.deadservers.isDeadServer(serverName)) {
+      LOG.warn("Expiration called on {} but crash processing in progress, serverStateNode={}",
+          serverName,
+          this.master.getAssignmentManager().getRegionStates().getServerNode(serverName));
+      return false;
+    }
+
+    if (!moveFromOnlineToDeadServers(serverName)) {
+      LOG.info("Expiration called on {} but NOT online", serverName);
+      // Continue.
+    }
 
     // If cluster is going down, yes, servers are going to be expiring; don't
     // process as a dead server
@@ -571,20 +595,24 @@ public class ServerManager {
     return true;
   }
 
+  /**
+   * @return Returns true if was online.
+   */
   @VisibleForTesting
-  public void moveFromOnlineToDeadServers(final ServerName sn) {
+  public boolean moveFromOnlineToDeadServers(final ServerName sn) {
+    boolean online = false;
     synchronized (onlineServers) {
-      if (!this.onlineServers.containsKey(sn)) {
-        LOG.trace("Expiration of {} but server not online", sn);
-      }
       // Remove the server from the known servers lists and update load info BUT
       // add to deadservers first; do this so it'll show in dead servers list if
       // not in online servers list.
       this.deadservers.add(sn);
-      this.onlineServers.remove(sn);
-      onlineServers.notifyAll();
+      if (this.onlineServers.remove(sn) != null) {
+        online = true;
+        onlineServers.notifyAll();
+      }
     }
     this.rsAdmins.remove(sn);
+    return online;
   }
 
   /*
@@ -715,19 +743,22 @@ public class ServerManager {
    * RegionServers to check-in.
    */
   private int getMinToStart() {
-    // One server should be enough to get us off the ground.
-    int requiredMinToStart = 1;
-    if (LoadBalancer.isTablesOnMaster(master.getConfiguration())) {
-      if (LoadBalancer.isSystemTablesOnlyOnMaster(master.getConfiguration())) {
-        // If Master is carrying regions but NOT user-space regions, it
-        // still shows as a 'server'. We need at least one more server to check
-        // in before we can start up so set defaultMinToStart to 2.
-        requiredMinToStart = requiredMinToStart + 1;
-      }
+    if (master.isInMaintenanceMode()) {
+      // If in maintenance mode, then master hosting meta will be the only server available
+      return 1;
     }
+
+    int minimumRequired = 1;
+    if (LoadBalancer.isTablesOnMaster(master.getConfiguration()) &&
+        LoadBalancer.isSystemTablesOnlyOnMaster(master.getConfiguration())) {
+      // If Master is carrying regions it will show up as a 'server', but is not handling user-
+      // space regions, so we need a second server.
+      minimumRequired = 2;
+    }
+
     int minToStart = this.master.getConfiguration().getInt(WAIT_ON_REGIONSERVERS_MINTOSTART, -1);
-    // Ensure we are never less than requiredMinToStart else stuff won't work.
-    return minToStart == -1 || minToStart < requiredMinToStart? requiredMinToStart: minToStart;
+    // Ensure we are never less than minimumRequired else stuff won't work.
+    return Math.max(minToStart, minimumRequired);
   }
 
   /**
